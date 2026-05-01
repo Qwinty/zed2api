@@ -482,7 +482,7 @@ fn convertAndSendOpenAI(client_stream: std.net.Stream, line: []const u8, model: 
                                     try std.json.Stringify.encodeJsonString(name_val.string, .{}, w);
                                     try w.writeAll(",\"arguments\":");
                                     try std.json.Stringify.encodeJsonString(args_buf.written(), .{}, w);
-                                    try w.writeAll("}}]}},\"finish_reason\":null}]}\n\n");
+                                    try w.writeAll("}}]},\"finish_reason\":null}]}\n\n");
                                     try socket.send(client_stream, tool_buf.written());
                                 }
                             }
