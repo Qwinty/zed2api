@@ -535,6 +535,7 @@ pub fn loginWithServer(allocator: std.mem.Allocator, keypair: *RsaKeyPair, tcp: 
     var user_id: ?[]const u8 = null;
     var encrypted_token: ?[]const u8 = null;
     defer if (user_id) |u| allocator.free(u);
+    defer if (encrypted_token) |t| allocator.free(t);
 
     var query_parts = std.mem.splitScalar(u8, query, '&');
     while (query_parts.next()) |param| {
