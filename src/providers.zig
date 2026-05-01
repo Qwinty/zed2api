@@ -119,7 +119,7 @@ fn writeMessageWithToolSupport(w: *std.io.Writer, msg: std.json.Value, allocator
     if (std.mem.eql(u8, role, "tool")) {
         const tool_call_id = switch (msg.object.get("tool_call_id") orelse return) { .string => |s| s, else => return };
         const content = msg.object.get("content") orelse return;
-        try w.writeAll("{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":");
+        try w.writeAll("{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"is_error\":false,\"tool_use_id\":");
         try std.json.Stringify.encodeJsonString(tool_call_id, .{}, w);
         try w.writeAll(",\"content\":");
         switch (content) {
