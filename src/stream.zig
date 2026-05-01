@@ -267,6 +267,7 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
 /// Mutable state for the OpenAI streaming path
 const OpenAIState = struct {
     finish_reason: []const u8 = "stop",
+    next_tool_index: usize = 0,
 };
 
 /// Convert a single Zed streaming JSON line to OpenAI SSE chunks
@@ -435,19 +436,54 @@ fn convertAndSendOpenAI(client_stream: std.net.Stream, line: []const u8, model: 
                     if (content == .object) {
                         if (content.object.get("parts")) |parts| {
                             if (parts == .array and parts.array.items.len > 0) {
-                                const part = parts.array.items[0];
-                                if (part == .object) {
+                                for (parts.array.items) |part| {
+                                    if (part != .object) continue;
+
                                     if (part.object.get("text")) |t| {
                                         if (t == .string and t.string.len > 0) {
-                                            var buf: std.io.Writer.Allocating = .init(allocator);
-                                            defer buf.deinit();
-                                            const w = &buf.writer;
-                                            try w.print("data: {{\"id\":\"chatcmpl-zed\",\"object\":\"chat.completion.chunk\",\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":", .{model});
-                                            try std.json.Stringify.encodeJsonString(t.string, .{}, w);
-                                            try w.writeAll("},\"finish_reason\":null}]}\n\n");
-                                            try socket.send(client_stream, buf.written());
+                                            var text_buf: std.io.Writer.Allocating = .init(allocator);
+                                            defer text_buf.deinit();
+                                            const tw = &text_buf.writer;
+                                            try tw.print("data: {{\"id\":\"chatcmpl-zed\",\"object\":\"chat.completion.chunk\",\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":", .{model});
+                                            try std.json.Stringify.encodeJsonString(t.string, .{}, tw);
+                                            try tw.writeAll("},\"finish_reason\":null}]}\n\n");
+                                            try socket.send(client_stream, text_buf.written());
                                         }
                                     }
+
+                                    const fc_opt = part.object.get("functionCall") orelse part.object.get("function_call") orelse continue;
+                                    if (fc_opt != .object) continue;
+
+                                    const name_val = fc_opt.object.get("name") orelse continue;
+                                    if (name_val != .string) continue;
+
+                                    const args_val = fc_opt.object.get("args") orelse fc_opt.object.get("arguments");
+                                    var args_buf: std.io.Writer.Allocating = .init(allocator);
+                                    defer args_buf.deinit();
+                                    if (args_val) |av| {
+                                        try std.json.Stringify.value(av, .{}, &args_buf.writer);
+                                    } else {
+                                        try args_buf.writer.writeAll("{}");
+                                    }
+
+                                    const idx = state.next_tool_index;
+                                    state.next_tool_index += 1;
+                                    state.finish_reason = "tool_calls";
+
+                                    const tool_id = try std.fmt.allocPrint(allocator, "call_google_{d}", .{idx});
+                                    defer allocator.free(tool_id);
+
+                                    var tool_buf: std.io.Writer.Allocating = .init(allocator);
+                                    defer tool_buf.deinit();
+                                    const w = &tool_buf.writer;
+                                    try w.print("data: {{\"id\":\"chatcmpl-zed\",\"object\":\"chat.completion.chunk\",\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":{d},\"id\":", .{ model, idx });
+                                    try std.json.Stringify.encodeJsonString(tool_id, .{}, w);
+                                    try w.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
+                                    try std.json.Stringify.encodeJsonString(name_val.string, .{}, w);
+                                    try w.writeAll(",\"arguments\":");
+                                    try std.json.Stringify.encodeJsonString(args_buf.written(), .{}, w);
+                                    try w.writeAll("}}]}},\"finish_reason\":null}]}\n\n");
+                                    try socket.send(client_stream, tool_buf.written());
                                 }
                             }
                         }
@@ -455,6 +491,7 @@ fn convertAndSendOpenAI(client_stream: std.net.Stream, line: []const u8, model: 
                 }
             }
         }
+        return;
     }
 }
 

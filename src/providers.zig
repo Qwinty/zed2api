@@ -699,11 +699,40 @@ pub fn extractContentFromStream(allocator: std.mem.Allocator, response: []const 
                         if (content == .object) {
                             if (content.object.get("parts")) |parts| {
                                 if (parts == .array) for (parts.array.items) |part| {
-                                    if (part == .object) {
-                                        if (part.object.get("text")) |t| {
-                                            if (t == .string) try text_buf.writer.writeAll(t.string);
-                                        }
+                                    if (part != .object) continue;
+
+                                    if (part.object.get("text")) |t| {
+                                        if (t == .string) try text_buf.writer.writeAll(t.string);
                                     }
+
+                                    const fc = part.object.get("functionCall") orelse part.object.get("function_call") orelse continue;
+                                    if (fc != .object) continue;
+                                    const name = switch (fc.object.get("name") orelse continue) {
+                                        .string => |s| s,
+                                        else => continue,
+                                    };
+
+                                    if (tool_count > 0) try tool_buf.writer.writeAll(",");
+                                    const tool_id = try std.fmt.allocPrint(allocator, "call_google_{d}", .{tool_count});
+                                    defer allocator.free(tool_id);
+
+                                    try tool_buf.writer.writeAll("{\"id\":");
+                                    try std.json.Stringify.encodeJsonString(tool_id, .{}, &tool_buf.writer);
+                                    try tool_buf.writer.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
+                                    try std.json.Stringify.encodeJsonString(name, .{}, &tool_buf.writer);
+                                    try tool_buf.writer.writeAll(",\"arguments\":");
+
+                                    if (fc.object.get("args") orelse fc.object.get("arguments")) |args| {
+                                        var args_buf: std.io.Writer.Allocating = .init(allocator);
+                                        defer args_buf.deinit();
+                                        try std.json.Stringify.value(args, .{}, &args_buf.writer);
+                                        try std.json.Stringify.encodeJsonString(args_buf.written(), .{}, &tool_buf.writer);
+                                    } else {
+                                        try tool_buf.writer.writeAll("\"{}\"");
+                                    }
+
+                                    try tool_buf.writer.writeAll("}}");
+                                    tool_count += 1;
                                 };
                             }
                         }
