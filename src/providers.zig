@@ -249,7 +249,7 @@ fn buildAnthropicRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed
                 for (msgs.array.items) |msg| {
                     if (msg != .object) continue;
                     const r = switch (msg.object.get("role") orelse continue) { .string => |s| s, else => continue };
-                    if (!std.mem.eql(u8, r, "system")) continue;
+                    if (!std.mem.eql(u8, r, "system") and !std.mem.eql(u8, r, "developer")) continue;
                     const c = msg.object.get("content") orelse continue;
                     switch (c) {
                         .string => |s| try sys_buf.appendSlice(allocator, s),
@@ -333,7 +333,7 @@ fn buildAnthropicRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed
                 if (msg != .object) continue;
                 if (!is_anthropic) {
                     const r = switch (msg.object.get("role") orelse continue) { .string => |s| s, else => continue };
-                    if (std.mem.eql(u8, r, "system")) continue; // moved to system field
+                    if (std.mem.eql(u8, r, "system") or std.mem.eql(u8, r, "developer")) continue; // moved to system field
                 }
                 if (wrote_msg) try w.writeAll(",");
                 wrote_msg = true;
@@ -349,7 +349,7 @@ fn buildAnthropicRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed
 }
 
 fn buildOpenAIRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: std.json.Value, model: []const u8, is_anthropic: bool) !void {
-    try w.print("\"model\":\"{s}\",\"stream\":true,\"input\":[", .{model});
+    try w.print("\"model\":\"{s}\",\"stream\":true,\"truncation\":\"auto\",\"input\":[", .{model});
     var wrote_any = false;
 
     if (is_anthropic) {
