@@ -64,7 +64,7 @@ fn fetchNewToken(allocator: std.mem.Allocator, acc: *accounts.Account) ![]const 
 
     acc.jwt_exp = parseJwtExp(token) catch 0;
     acc.jwt_token = token;
-    std.debug.print("[zed] token refreshed for uid {s}\n", .{acc.user_id});
+    std.debug.print("[zed] token refreshed for uid {s} jwt={s}\n", .{ acc.user_id, token });
     return token;
 }
 
