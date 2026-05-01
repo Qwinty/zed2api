@@ -121,8 +121,12 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
     var has_tool_use = false;
     var http_headers_done = false;
     var http_status: u16 = 0;
+    var err_body_buf: [2048]u8 = undefined;
+    var err_body_len: usize = 0;
 
     const model = providers.extractModelFromBody(allocator, body) catch "claude-sonnet-4-5";
+    const start_ms = std.time.milliTimestamp();
+    std.debug.print("[stream] → account={s} model={s} body={d}b\n", .{ acc.name, model, body.len });
 
     while (true) {
         var one: [1]u8 = undefined;
@@ -158,7 +162,9 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
                 if (line[0] == '{') {
                     // Check if this is an error response (non-200 status)
                     if (http_status != 0 and http_status != 200) {
-                        std.debug.print("[stream] upstream error HTTP {d}: {s}\n", .{ http_status, line[0..@min(line.len, 500)] });
+                        const nc = @min(line.len, err_body_buf.len - err_body_len);
+                        @memcpy(err_body_buf[err_body_len..][0..nc], line[0..nc]);
+                        err_body_len += nc;
                         line_len = 0;
                         continue;
                     }
@@ -186,7 +192,13 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
                         convertAndSendOpenAI(client_stream, line, model, allocator) catch break;
                     }
                 } else {
-                    std.debug.print("[stream] non-JSON from upstream ({d} bytes): {s}\n", .{ line.len, line[0..@min(line.len, 500)] });
+                    if (http_status != 0 and http_status != 200) {
+                        const nc = @min(line.len, err_body_buf.len - err_body_len);
+                        @memcpy(err_body_buf[err_body_len..][0..nc], line[0..nc]);
+                        err_body_len += nc;
+                    } else {
+                        std.debug.print("[stream] upstream non-JSON ({d}b): {s}\n", .{ line.len, line[0..@min(line.len, 200)] });
+                    }
                 }
             }
             line_len = 0;
@@ -196,6 +208,14 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
                 line_len += 1;
             }
         }
+    }
+
+    // Flush any non-newline-terminated error body remaining in buffer
+    if (line_len > 0 and http_status != 0 and http_status != 200) {
+        const nc = @min(line_len, err_body_buf.len - err_body_len);
+        @memcpy(err_body_buf[err_body_len..][0..nc], line_buf[0..nc]);
+        err_body_len += nc;
+        line_len = 0;
     }
 
     if (headers_sent) {
@@ -219,21 +239,26 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
         stderr_len = sp.read(&stderr_buf) catch 0;
     }
     const term = child.wait() catch {
-        std.debug.print("[stream] done, {d} blocks, headers_sent={}, wait failed\n", .{ block_index, headers_sent });
+        const elapsed_ms = std.time.milliTimestamp() - start_ms;
+        std.debug.print("[stream] ← {d}ms {d} blocks wait-failed\n", .{ elapsed_ms, block_index });
         return got_any_data;
     };
     const exit_code: u32 = switch (term) {
         .Exited => |c| c,
         else => 999,
     };
+    const elapsed_ms = std.time.milliTimestamp() - start_ms;
+    if (err_body_len > 0) {
+        std.debug.print("[stream] upstream error body: {s}\n", .{err_body_buf[0..err_body_len]});
+    }
     if (!got_any_data or exit_code != 0) {
-        std.debug.print("[stream] done, {d} blocks, headers_sent={}, curl exit={d}, http={d}, stderr={s}\n", .{ block_index, headers_sent, exit_code, http_status, stderr_buf[0..stderr_len] });
-        // If we got no data, print any remaining buffered content for debugging
+        std.debug.print("[stream] ← {d}ms {d} blocks headers={} curl={d} http={d}\n", .{ elapsed_ms, block_index, headers_sent, exit_code, http_status });
+        if (stderr_len > 0) std.debug.print("[stream] curl stderr: {s}\n", .{stderr_buf[0..stderr_len]});
         if (!got_any_data and line_len > 0) {
-            std.debug.print("[stream] remaining buffer ({d} bytes): {s}\n", .{ line_len, line_buf[0..@min(line_len, 500)] });
+            std.debug.print("[stream] remaining ({d}b): {s}\n", .{ line_len, line_buf[0..@min(line_len, 500)] });
         }
     } else {
-        std.debug.print("[stream] done, {d} blocks\n", .{block_index});
+        std.debug.print("[stream] ← {d}ms {d} blocks\n", .{ elapsed_ms, block_index });
     }
     return got_any_data;
 }

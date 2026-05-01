@@ -118,12 +118,14 @@ fn handleConnection(conn_stream: std.net.Stream) void {
     }
 
     // Non-streaming route
+    const t0 = std.time.milliTimestamp();
     const response = route(method, path, body) catch |err| {
-        std.debug.print("[zed2api] route error: {} for {s} {s}\n", .{ err, method, path });
+        std.debug.print("[req] {s} {s} → 500 error={}\n", .{ method, path, err });
         socket.writeResponse(conn_stream, 500, "{\"error\":\"internal error\"}");
         return;
     };
     defer if (response.allocated) global_allocator.free(response.body);
+    std.debug.print("[req] {s} {s} → {d} ({d}ms)\n", .{ method, path, response.status, std.time.milliTimestamp() - t0 });
     socket.writeResponseWithType(conn_stream, response.status, response.body, response.content_type);
 }
 

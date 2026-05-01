@@ -202,6 +202,7 @@ pub fn buildZedPayload(allocator: std.mem.Allocator, body: []const u8, is_anthro
 
     const model = extractModel(parsed.value);
     const provider = getProvider(model);
+    std.debug.print("[providers] model={s} provider={s}\n", .{ model, provider });
 
     var zed_body: std.io.Writer.Allocating = .init(allocator);
     errdefer zed_body.deinit();
