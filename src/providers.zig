@@ -2,13 +2,23 @@ const std = @import("std");
 
 /// Map Claude Code model names to Zed-compatible names
 pub fn normalizeModelName(name: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, name, "claude-opus-4-6")) return "claude-opus-4-6";
-    if (std.mem.startsWith(u8, name, "claude-opus-4-5")) return "claude-opus-4-5";
-    if (std.mem.startsWith(u8, name, "claude-opus-4-1")) return "claude-opus-4-1";
+    if (std.mem.startsWith(u8, name, "claude-sonnet-4-6")) return "claude-sonnet-4-6";
     if (std.mem.startsWith(u8, name, "claude-sonnet-4-5")) return "claude-sonnet-4-5";
-    if (std.mem.startsWith(u8, name, "claude-sonnet-4")) return "claude-sonnet-4";
-    if (std.mem.startsWith(u8, name, "claude-3-7-sonnet")) return "claude-3-7-sonnet";
     if (std.mem.startsWith(u8, name, "claude-haiku-4-5")) return "claude-haiku-4-5";
+    if (std.mem.startsWith(u8, name, "gpt-5.5")) return "gpt-5.5";
+    if (std.mem.startsWith(u8, name, "gpt-5.4")) return "gpt-5.4";
+    if (std.mem.startsWith(u8, name, "gpt-5.3-codex")) return "gpt-5.3-codex";
+    if (std.mem.startsWith(u8, name, "gpt-5.2-codex")) return "gpt-5.2-codex";
+    if (std.mem.startsWith(u8, name, "gpt-5.2")) return "gpt-5.2";
+    if (std.mem.startsWith(u8, name, "gpt-5-mini")) return "gpt-5-mini";
+    if (std.mem.startsWith(u8, name, "gpt-5-nano")) return "gpt-5-nano";
+    if (std.mem.startsWith(u8, name, "gemini-3.1-pro")) return "gemini-3.1-pro-preview";
+    if (std.mem.startsWith(u8, name, "gemini-3-flash")) return "gemini-3-flash";
+    if (std.mem.startsWith(u8, name, "grok-4-fast-non-reasoning")) return "grok-4-fast-non-reasoning";
+    if (std.mem.startsWith(u8, name, "grok-4-fast-reasoning")) return "grok-4-fast-reasoning";
+    if (std.mem.startsWith(u8, name, "grok-4-fast")) return "grok-4-fast-reasoning";
+    if (std.mem.startsWith(u8, name, "grok-4")) return "grok-4";
+    if (std.mem.startsWith(u8, name, "grok-code-fast-1")) return "grok-code-fast-1";
     return name;
 }
 
@@ -25,16 +35,16 @@ pub fn extractModel(root: std.json.Value) []const u8 {
     if (root.object.get("model")) |mv| {
         if (mv == .string) return normalizeModelName(mv.string);
     }
-    return "claude-sonnet-4-5";
+    return "claude-sonnet-4-6";
 }
 
 pub fn extractModelFromBody(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return "claude-sonnet-4-5";
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return "claude-sonnet-4-6";
     defer parsed.deinit();
     if (parsed.value.object.get("model")) |mv| {
-        if (mv == .string) return allocator.dupe(u8, mv.string) catch return "claude-sonnet-4-5";
+        if (mv == .string) return allocator.dupe(u8, mv.string) catch return "claude-sonnet-4-6";
     }
-    return "claude-sonnet-4-5";
+    return "claude-sonnet-4-6";
 }
 
 /// Extract system text from Anthropic-format system field (string or array)
@@ -229,6 +239,35 @@ fn buildAnthropicRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed
             try std.json.Stringify.encodeJsonString(sys_text, .{}, w);
             try w.writeAll(",");
         }
+    } else {
+        // OpenAI format: collect system-role messages into Anthropic "system" field
+        if (parsed.object.get("messages")) |msgs| {
+            if (msgs == .array) {
+                var sys_buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer sys_buf.deinit(allocator);
+                for (msgs.array.items) |msg| {
+                    if (msg != .object) continue;
+                    const r = switch (msg.object.get("role") orelse continue) { .string => |s| s, else => continue };
+                    if (!std.mem.eql(u8, r, "system")) continue;
+                    const c = msg.object.get("content") orelse continue;
+                    switch (c) {
+                        .string => |s| try sys_buf.appendSlice(allocator, s),
+                        .array => for (c.array.items) |item| {
+                            if (item == .object) {
+                                const tv = item.object.get("text") orelse continue;
+                                if (tv == .string) try sys_buf.appendSlice(allocator, tv.string);
+                            }
+                        },
+                        else => {},
+                    }
+                }
+                if (sys_buf.items.len > 0) {
+                    try w.writeAll("\"system\":");
+                    try std.json.Stringify.encodeJsonString(sys_buf.items, .{}, w);
+                    try w.writeAll(",");
+                }
+            }
+        }
     }
     if (parsed.object.get("temperature")) |temp| {
         try w.writeAll("\"temperature\":"); try std.json.Stringify.value(temp, .{}, w); try w.writeAll(",");
@@ -287,14 +326,23 @@ fn buildAnthropicRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed
     }
     try w.writeAll("\"messages\":[");
     if (parsed.object.get("messages")) |msgs| {
-        if (msgs == .array) for (msgs.array.items, 0..) |msg, i| {
-            if (i > 0) try w.writeAll(",");
-            if (is_anthropic) {
-                try writeAnthropicMessage(w, msg);
-            } else {
-                try writeMessageWithToolSupport(w, msg, allocator);
+        if (msgs == .array) {
+            var wrote_msg = false;
+            for (msgs.array.items) |msg| {
+                if (msg != .object) continue;
+                if (!is_anthropic) {
+                    const r = switch (msg.object.get("role") orelse continue) { .string => |s| s, else => continue };
+                    if (std.mem.eql(u8, r, "system")) continue; // moved to system field
+                }
+                if (wrote_msg) try w.writeAll(",");
+                wrote_msg = true;
+                if (is_anthropic) {
+                    try writeAnthropicMessage(w, msg);
+                } else {
+                    try writeMessageWithToolSupport(w, msg, allocator);
+                }
             }
-        };
+        }
     }
     try w.writeAll("]");
 }
@@ -356,6 +404,35 @@ fn buildGoogleRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: s
             try std.json.Stringify.encodeJsonString(sys_text, .{}, w);
             try w.writeAll("}]},");
         }
+    } else {
+        // OpenAI format: collect system-role messages into systemInstruction
+        if (parsed.object.get("messages")) |msgs| {
+            if (msgs == .array) {
+                var sys_buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer sys_buf.deinit(allocator);
+                for (msgs.array.items) |msg| {
+                    if (msg != .object) continue;
+                    const r = switch (msg.object.get("role") orelse continue) { .string => |s| s, else => continue };
+                    if (!std.mem.eql(u8, r, "system")) continue;
+                    const c = msg.object.get("content") orelse continue;
+                    switch (c) {
+                        .string => |s| try sys_buf.appendSlice(allocator, s),
+                        .array => for (c.array.items) |item| {
+                            if (item == .object) {
+                                const tv = item.object.get("text") orelse continue;
+                                if (tv == .string) try sys_buf.appendSlice(allocator, tv.string);
+                            }
+                        },
+                        else => {},
+                    }
+                }
+                if (sys_buf.items.len > 0) {
+                    try w.writeAll("\"systemInstruction\":{\"parts\":[{\"text\":");
+                    try std.json.Stringify.encodeJsonString(sys_buf.items, .{}, w);
+                    try w.writeAll("}]},");
+                }
+            }
+        }
     }
 
     try w.writeAll("\"generationConfig\":{\"candidateCount\":1,\"stopSequences\":[],\"temperature\":1.0},");
@@ -406,12 +483,16 @@ fn buildGoogleRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: s
     try w.writeAll("\"contents\":[");
 
     if (parsed.object.get("messages")) |msgs| {
-        if (msgs == .array) for (msgs.array.items, 0..) |msg, i| {
+        if (msgs == .array) {
+            var wrote_content = false;
+            for (msgs.array.items) |msg| {
             if (msg != .object) continue;
             const role = switch (msg.object.get("role") orelse continue) { .string => |s| s, else => continue };
+            if (std.mem.eql(u8, role, "system")) continue; // moved to systemInstruction
             const content = msg.object.get("content") orelse continue;
-            if (i > 0) try w.writeAll(",");
-            const gemini_role = if (std.mem.eql(u8, role, "assistant")) "model" else role;
+            if (wrote_content) try w.writeAll(",");
+            wrote_content = true;
+            const gemini_role = if (std.mem.eql(u8, role, "assistant")) "model" else "user";
             try w.print("{{\"parts\":[", .{});
             switch (content) {
                 .string => |s| {
@@ -434,7 +515,8 @@ fn buildGoogleRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: s
                 else => {},
             }
             try w.print("],\"role\":\"{s}\"}}", .{gemini_role});
-        };
+        }
+        }
     }
     try w.writeAll("]");
 }

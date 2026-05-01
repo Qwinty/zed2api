@@ -169,12 +169,22 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
                             _ = child.wait() catch {};
                             return false;
                         };
-                        var msg_start_buf: [512]u8 = undefined;
-                        const msg_start = std.fmt.bufPrint(&msg_start_buf, "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_zed\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"{s}\",\"content\":[],\"stop_reason\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n", .{model}) catch "";
-                        socket.send(client_stream, msg_start) catch {};
+                        if (is_anthropic) {
+                            var msg_start_buf: [512]u8 = undefined;
+                            const msg_start = std.fmt.bufPrint(&msg_start_buf, "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_zed\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"{s}\",\"content\":[],\"stop_reason\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n", .{model}) catch "";
+                            socket.send(client_stream, msg_start) catch {};
+                        } else {
+                            var role_buf: [512]u8 = undefined;
+                            const role_chunk = std.fmt.bufPrint(&role_buf, "data: {{\"id\":\"chatcmpl-zed\",\"object\":\"chat.completion.chunk\",\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n", .{model}) catch "";
+                            socket.send(client_stream, role_chunk) catch {};
+                        }
                     }
                     got_any_data = true;
-                    convertAndSendSSE(client_stream, line, &block_index, &has_tool_use, allocator) catch break;
+                    if (is_anthropic) {
+                        convertAndSendSSE(client_stream, line, &block_index, &has_tool_use, allocator) catch break;
+                    } else {
+                        convertAndSendOpenAI(client_stream, line, model, allocator) catch break;
+                    }
                 } else {
                     std.debug.print("[stream] non-JSON from upstream ({d} bytes): {s}\n", .{ line.len, line[0..@min(line.len, 500)] });
                 }
@@ -189,11 +199,17 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
     }
 
     if (headers_sent) {
-        const stop_reason = if (has_tool_use) "tool_use" else "end_turn";
-        var stop_buf: [256]u8 = undefined;
-        const stop_msg = std.fmt.bufPrint(&stop_buf, "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n", .{stop_reason}) catch "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
-        socket.send(client_stream, stop_msg) catch {};
-        socket.send(client_stream, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n") catch {};
+        if (is_anthropic) {
+            const stop_reason = if (has_tool_use) "tool_use" else "end_turn";
+            var stop_buf: [256]u8 = undefined;
+            const stop_msg = std.fmt.bufPrint(&stop_buf, "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n", .{stop_reason}) catch "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
+            socket.send(client_stream, stop_msg) catch {};
+            socket.send(client_stream, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n") catch {};
+        } else {
+            var stop_buf: [512]u8 = undefined;
+            const stop_chunk = std.fmt.bufPrint(&stop_buf, "data: {{\"id\":\"chatcmpl-zed\",\"object\":\"chat.completion.chunk\",\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n", .{model}) catch "data: [DONE]\n\n";
+            socket.send(client_stream, stop_chunk) catch {};
+        }
     }
 
     const stderr_pipe = child.stderr;
@@ -220,6 +236,96 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
         std.debug.print("[stream] done, {d} blocks\n", .{block_index});
     }
     return got_any_data;
+}
+
+/// Convert a single Zed streaming JSON line to OpenAI SSE chunks
+fn convertAndSendOpenAI(client_stream: std.net.Stream, line: []const u8, model: []const u8, allocator: std.mem.Allocator) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return;
+    defer parsed.deinit();
+
+    const obj = if (parsed.value.object.get("event")) |event|
+        (if (event == .object) event else parsed.value)
+    else
+        parsed.value;
+
+    var text: ?[]const u8 = null;
+
+    // Anthropic content_block_delta from Zed
+    if (obj.object.get("type")) |et| {
+        if (et == .string and std.mem.eql(u8, et.string, "content_block_delta")) {
+            if (obj.object.get("delta")) |delta| {
+                if (delta == .object) {
+                    if (delta.object.get("text")) |t| { if (t == .string) text = t.string; }
+                    if (delta.object.get("thinking")) |t| { if (t == .string) text = t.string; }
+                }
+            }
+        }
+        // OpenAI choices delta (passthrough from xAI)
+        if (et == .string and std.mem.eql(u8, et.string, "chat.completion.chunk")) {
+            if (obj.object.get("choices")) |ch| {
+                if (ch == .array and ch.array.items.len > 0) {
+                    const choice = ch.array.items[0];
+                    if (choice == .object) {
+                        if (choice.object.get("delta")) |d| {
+                            if (d == .object) {
+                                if (d.object.get("content")) |c| { if (c == .string) text = c.string; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // xAI choices
+    if (obj.object.get("choices")) |choices| {
+        if (choices == .array and choices.array.items.len > 0) {
+            const choice = choices.array.items[0];
+            if (choice == .object) {
+                if (choice.object.get("delta")) |delta| {
+                    if (delta == .object) {
+                        if (delta.object.get("content")) |c| { if (c == .string) text = c.string; }
+                    }
+                }
+            }
+        }
+    }
+    // Google candidates
+    if (obj.object.get("candidates")) |candidates| {
+        if (candidates == .array and candidates.array.items.len > 0) {
+            const cand = candidates.array.items[0];
+            if (cand == .object) {
+                if (cand.object.get("content")) |content| {
+                    if (content == .object) {
+                        if (content.object.get("parts")) |parts| {
+                            if (parts == .array and parts.array.items.len > 0) {
+                                const part = parts.array.items[0];
+                                if (part == .object) {
+                                    if (part.object.get("text")) |t| { if (t == .string) text = t.string; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // OpenAI response.output_text.delta
+    if (obj.object.get("type")) |et| {
+        if (et == .string and std.mem.eql(u8, et.string, "response.output_text.delta")) {
+            if (obj.object.get("delta")) |d| { if (d == .string) text = d.string; }
+        }
+    }
+
+    if (text) |t| {
+        if (t.len == 0) return;
+        var buf: std.io.Writer.Allocating = .init(allocator);
+        defer buf.deinit();
+        const w = &buf.writer;
+        try w.print("data: {{\"id\":\"chatcmpl-zed\",\"object\":\"chat.completion.chunk\",\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":", .{model});
+        try std.json.Stringify.encodeJsonString(t, .{}, w);
+        try w.writeAll("},\"finish_reason\":null}]}\n\n");
+        try socket.send(client_stream, buf.written());
+    }
 }
 
 /// Convert a single Zed streaming JSON line to Anthropic SSE events
