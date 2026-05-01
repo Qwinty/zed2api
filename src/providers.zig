@@ -364,7 +364,8 @@ fn buildOpenAIRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: s
     if (parsed.object.get("messages")) |msgs| {
         if (msgs == .array) for (msgs.array.items) |msg| {
             if (msg != .object) continue;
-            const role = switch (msg.object.get("role") orelse continue) { .string => |s| s, else => continue };
+            const role_raw = switch (msg.object.get("role") orelse continue) { .string => |s| s, else => continue };
+            const role = if (std.mem.eql(u8, role_raw, "developer")) "system" else role_raw;
             const content = msg.object.get("content") orelse continue;
             if (wrote_any) try w.writeAll(",");
             wrote_any = true;
