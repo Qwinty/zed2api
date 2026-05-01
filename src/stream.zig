@@ -73,7 +73,7 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
         defer f.close();
         f.writeAll(payload) catch return false;
     }
-    // defer std.fs.cwd().deleteFile(tmp_path) catch {}; // DEBUG: keep file
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
     const at_path = std.fmt.allocPrint(allocator, "@{s}", .{tmp_path}) catch return false;
     defer allocator.free(at_path);
